@@ -7,7 +7,34 @@ from tools.utils import results_file_to_dict
 import datetime
 import argparse
 import boto3
+import json
 
+def replace_strings(data, replacement_dict):
+    if isinstance(data, str):
+        # Replace any substrings matching dictionary keys with their values
+        for key, value in replacement_dict.items():
+            data = data.replace(key, value)
+        return data
+    elif isinstance(data, list):
+        # Recursively process each element in the list
+        return [replace_strings(item, replacement_dict) for item in data]
+    elif isinstance(data, dict):
+        # Recursively process each value in the dictionary
+        return {k: replace_strings(v, replacement_dict) for k, v in data.items()}
+    else:
+        # Return data unchanged if it's not a string, list, or dictionary
+        return data
+
+def find_scoutid_names(data,scoutid_name_map):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key.startswith("scoutid-") and isinstance(value, dict) and 'name' in value:
+                scoutid_name_map[key] = value['name']
+            else:
+                find_scoutid_names(value, scoutid_name_map)
+    elif isinstance(data, list):
+        for item in data:
+            find_scoutid_names(item, scoutid_name_map)
 
 def upload_findigs_to_securityhub(session, formatted_findings_list):
     try:
@@ -26,7 +53,7 @@ def format_finding_to_securityhub_format(aws_account_id,
                                          region,
                                          creation_date,
                                          finding_key,
-                                         finding_value):
+                                         finding_value,scoutid_name_map):
     try:
 
         if finding_value.get('level') == 'danger':
@@ -37,6 +64,27 @@ def format_finding_to_securityhub_format(aws_account_id,
             label = 'INFORMATIONAL'
 
         format_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+        resource_id = replace_strings(finding_value.get('items'),scoutid_name_map)
+        if isinstance(resource_id, list):
+            resources = [
+                {
+                    'Type': 'undefined',
+                    'Id': str(res),  # Ensure each resource ID is a string
+                    'Partition': 'aws',
+                    'Region': region
+                }
+                for res in resource_id[:32]
+            ]
+        else:
+            resources = [
+                {
+                    'Type': 'undefined',
+                    'Id': str(resource_id),  # Ensure resource_id is a string
+                    'Partition': 'aws',
+                    'Region': region
+                }
+            ]
 
         formatted_finding = {
             'SchemaVersion': '2018-10-08',
@@ -60,14 +108,7 @@ def format_finding_to_securityhub_format(aws_account_id,
                 }
             },
             'ProductFields': {'Product Name': 'Scout Suite'},
-            'Resources': [  # TODO this lacks affected resources
-                {
-                    'Type': 'AwsAccount',
-                    'Id': 'AWS::::Account:' + creation_date,
-                    'Partition': 'aws',
-                    'Region': region
-                }
-            ],
+            'Resources': resources,
             'Compliance': {
                 'Status': 'FAILED'
             },
@@ -79,7 +120,7 @@ def format_finding_to_securityhub_format(aws_account_id,
 
 
 def process_results_file(f,
-                         region):
+                         region,scoutid_name_map):
     try:
         formatted_findings_list = []
         results = results_file_to_dict(f)
@@ -94,7 +135,8 @@ def process_results_file(f,
                                                                              region,
                                                                              creation_date,
                                                                              finding_key,
-                                                                             finding_value)
+                                                                             finding_value,
+                                                                             scoutid_name_map)
                     formatted_findings_list.append(formatted_finding)
 
         return formatted_findings_list
@@ -102,19 +144,25 @@ def process_results_file(f,
         print_exception(f'Unable to process results file: {e}')
 
 
-def run(profile, file):
-    session = boto3.Session(profile_name=profile)
+def run(file):
+    session = boto3.Session()
     # Test querying for current user
     get_caller_identity(session)
-    print_info(f'Authenticated with profile {profile}')
-
+    print_info(f'Authenticated with the provided environment credentials')
+     
     try:
         with open(file) as f:
+            data = json.loads(f.read().split('=', 1)[1].strip())
+            # Dictionary to store the associations
+            scoutid_name_map = {}
+            find_scoutid_names(data,scoutid_name_map)
+            f.seek(0)
             formatted_findings_list = process_results_file(f,
-                                                           session.region_name)
+                                                           session.region_name,scoutid_name_map)
     except Exception as e:
-        print_exception(f'Unable to open file {file}: {e}')
+        print_exception(f'Error during processing {file}: {e}')
 
+    #print_info(f'List of findings : {formatted_findings_list}')
     upload_findigs_to_securityhub(session, formatted_findings_list)
 
 
@@ -124,10 +172,6 @@ if __name__ == "__main__":
     set_logger_configuration()
 
     parser = argparse.ArgumentParser(description='Tool to upload a JSON report to AWS Security Hub')
-    parser.add_argument('-p', '--profile',
-                        required=False,
-                        default="default",
-                        help="The named profile to use to authenticate to AWS. Defaults to \"default\".")
     parser.add_argument('-f', '--file',
                         required=True,
                         help="The path of the JSON results file to process, e.g. "
@@ -135,6 +179,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        run(args.profile, args.file)
+        run(args.file)
     except Exception as e:
         print_exception(f'Unable to complete: {e}')
